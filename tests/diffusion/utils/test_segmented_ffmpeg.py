@@ -98,7 +98,9 @@ class TestPlanSegments:
             plan_segments(4, 8)
 
     def test_segment_plan_rejects_gap(self) -> None:
-        with pytest.raises(ValueError, match="expected 10"):
+        # The gap [3, 6) is rejected by the per-segment start check, whose
+        # message names the expected start of the offending segment.
+        with pytest.raises(ValueError, match=r"segment 1: start=6, expected 3"):
             SegmentPlan(
                 total_frames=10,
                 process_count=2,
@@ -239,7 +241,10 @@ class TestFailurePaths:
         # The queue timeout is 15s; patch it to instant to fail fast.
         import queue
 
-        def instant_put(item, timeout=None):
+        # queue.Queue.put_nowait() delegates to put(item, block=False), and
+        # enc.abort() (this test's cleanup) uses put_nowait to inject EOS,
+        # so the mock must accept the full put() signature.
+        def instant_put(item, block=True, timeout=None):
             raise queue.Full("injected failure")
 
         enc._segments[0].queue.put = instant_put  # type: ignore[method-assign]
