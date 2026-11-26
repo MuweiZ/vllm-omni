@@ -116,15 +116,27 @@ class TestPlanSegments:
 class TestPreflight:
     def test_accepts_1_2_4_processes(self) -> None:
         for n in (1, 2, 4):
-            preflight_check(width=24, height=16, process_count=n)
+            preflight_check(width=24, height=16, process_count=n, total_frames=8)
 
     def test_rejects_bad_process_count(self) -> None:
         with pytest.raises(ValueError, match="supports 1, 2, or 4"):
-            preflight_check(width=24, height=16, process_count=3)
+            preflight_check(width=24, height=16, process_count=3, total_frames=8)
 
     def test_rejects_non_positive_size(self) -> None:
         with pytest.raises(ValueError, match="width and height"):
-            preflight_check(width=0, height=16, process_count=1)
+            preflight_check(width=0, height=16, process_count=1, total_frames=8)
+
+    def test_rejects_missing_total_frames(self) -> None:
+        with pytest.raises(TypeError, match="total_frames"):
+            preflight_check(width=24, height=16, process_count=1)
+
+    def test_rejects_non_positive_total_frames(self) -> None:
+        with pytest.raises(ValueError, match="total_frames is required"):
+            preflight_check(width=24, height=16, process_count=1, total_frames=0)
+
+    def test_rejects_more_processes_than_frames(self) -> None:
+        with pytest.raises(ValueError, match="cannot exceed total_frames"):
+            preflight_check(width=24, height=16, process_count=4, total_frames=2)
 
     def test_build_ffmpeg_command_runs(self, tmp_path) -> None:
         cmd = build_ffmpeg_command(width=24, height=16, fps=12, frame_count=4, output_path=str(tmp_path / "seg.mp4"))
@@ -141,7 +153,7 @@ class TestPreflight:
 class TestSegmentedFFmpegEncoder:
     def test_single_process_matches_frame_count(self) -> None:
         frames = _frames(total=12, height=16, width=24)
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=12, process_count=1)
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=12, process_count=1, total_frames=12)
         enc.push(frames[:4])
         enc.push(frames[4:8])
         enc.push(frames[8:])
@@ -150,7 +162,7 @@ class TestSegmentedFFmpegEncoder:
 
     def test_two_process_matches_frame_count(self) -> None:
         frames = _frames(total=24, height=16, width=24)
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=12, process_count=2)
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=12, process_count=2, total_frames=24)
         enc.push(frames[:8])
         enc.push(frames[8:16])
         enc.push(frames[16:])
@@ -159,7 +171,7 @@ class TestSegmentedFFmpegEncoder:
 
     def test_four_process_matches_frame_count(self) -> None:
         frames = _frames(total=32, height=16, width=24)
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=12, process_count=4)
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=12, process_count=4, total_frames=32)
         enc.push(frames[:8])
         enc.push(frames[8:16])
         enc.push(frames[16:24])
@@ -177,7 +189,7 @@ class TestSegmentedFFmpegEncoder:
 
     def test_silent_output_when_no_audio(self) -> None:
         frames = _frames(total=8)
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8)
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, total_frames=8)
         enc.push(frames)
         result = enc.finish()
         assert not _has_audio_track(result)
@@ -186,7 +198,9 @@ class TestSegmentedFFmpegEncoder:
         frames = _frames(total=8)
         mono = np.zeros(4000, dtype=np.float32)
         mono[:500] = 0.5
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, audio_waveform=mono, audio_sample_rate=8000)
+        enc = SegmentedFFmpegEncoder(
+            width=24, height=16, fps=8, audio_waveform=mono, audio_sample_rate=8000, total_frames=8
+        )
         enc.push(frames)
         result = enc.finish()
         assert _has_audio_track(result)
@@ -196,7 +210,9 @@ class TestSegmentedFFmpegEncoder:
         stereo = np.zeros((2, 4000), dtype=np.float32)
         stereo[0, :500] = 0.5
         stereo[1, :500] = -0.5
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, audio_waveform=stereo, audio_sample_rate=8000)
+        enc = SegmentedFFmpegEncoder(
+            width=24, height=16, fps=8, audio_waveform=stereo, audio_sample_rate=8000, total_frames=8
+        )
         enc.push(frames)
         result = enc.finish()
         assert _has_audio_track(result)
@@ -209,7 +225,13 @@ class TestSegmentedFFmpegEncoder:
         # Half of that = 1 second = 8000 samples.
         short_audio = np.zeros(8000, dtype=np.float32)
         enc = SegmentedFFmpegEncoder(
-            width=24, height=16, fps=12, audio_waveform=short_audio, audio_sample_rate=8000, process_count=2
+            width=24,
+            height=16,
+            fps=12,
+            audio_waveform=short_audio,
+            audio_sample_rate=8000,
+            process_count=2,
+            total_frames=24,
         )
         enc.push(frames)
         result = enc.finish()
@@ -281,7 +303,7 @@ class TestFailurePaths:
 
     def test_abort_terminates_workers(self) -> None:
         frames = _frames(total=8)
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, process_count=2, max_pending=1)
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, process_count=2, max_pending=1, total_frames=8)
         enc.push(frames[:2])
         enc.abort()
         # After abort, push must raise.
@@ -296,19 +318,19 @@ class TestFailurePaths:
 
 class TestValidation:
     def test_rejects_wrong_ndim(self) -> None:
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8)
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, total_frames=8)
         with pytest.raises(ValueError, match="shape"):
             enc.push(np.zeros((16, 24, 3), dtype=np.uint8))
         enc.abort()
 
     def test_rejects_wrong_dtype(self) -> None:
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8)
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, total_frames=8)
         with pytest.raises(ValueError, match="dtype"):
             enc.push(np.zeros((1, 16, 24, 3), dtype=np.float32))
         enc.abort()
 
     def test_rejects_wrong_size(self) -> None:
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8)
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, total_frames=8)
         with pytest.raises(ValueError, match="wrong frame size"):
             enc.push(np.zeros((2, 32, 32, 3), dtype=np.uint8))
         enc.abort()
@@ -334,26 +356,24 @@ class TestFFmpegProcessError:
 
 
 # ---------------------------------------------------------------------------
-# Fallback path (no total_frames up front)
+# total_frames contract (RFC 8887 fail-closed)
 # ---------------------------------------------------------------------------
 
 
-class TestFallbackPath:
-    def test_buffers_then_encodes(self) -> None:
-        frames = _frames(total=16)
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, process_count=2)
-        # Fallback path: no total_frames given; push accumulates, finish() plans.
-        enc.push(frames[:6])
-        enc.push(frames[6:12])
-        enc.push(frames[12:])
-        assert enc._plan is None  # no plan yet
-        result = enc.finish()
-        assert _count_mp4_frames(result) == 16
+class TestTotalFramesContract:
+    def test_missing_total_frames_fails_closed(self) -> None:
+        with pytest.raises(ValueError, match="total_frames is required"):
+            SegmentedFFmpegEncoder(width=24, height=16, fps=8, process_count=2)
 
-    def test_zero_frames_is_rejected(self) -> None:
-        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8)
-        with pytest.raises(RuntimeError, match="zero frames"):
-            enc.finish()
+    def test_zero_total_frames_fails_closed(self) -> None:
+        with pytest.raises(ValueError, match="total_frames is required"):
+            SegmentedFFmpegEncoder(width=24, height=16, fps=8, process_count=2, total_frames=0)
+
+    def test_plan_exists_before_first_push(self) -> None:
+        enc = SegmentedFFmpegEncoder(width=24, height=16, fps=8, process_count=2, total_frames=16)
+        assert enc._plan is not None
+        assert enc._plan.total_frames == 16
+        enc.abort()
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +398,7 @@ class TestChunkedVideoMP4SessionWiring:
             use_segmented_encoder=True,
             segmented_process_count=1,
             transfer_slots=0,  # force blocking copies
+            total_frames=3,  # one 3-frame chunk is pushed below
         )
         # Push one tiny chunk so _ensure_encoders fires.
         chunk = torch.zeros((1, 3, 3, 16, 24), dtype=torch.float32)
@@ -403,6 +424,69 @@ class TestChunkedVideoMP4SessionWiring:
         session.push(chunk)
         assert isinstance(session._encoders[0], ChunkedMP4Encoder)
         session.finish()
+
+    def test_segmented_session_requires_total_frames(self) -> None:
+        """RFC 8887 fail-closed: constructing a segmented session without a
+        frame count fails before any decoder work begins."""
+        from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session, SegmentedFFmpegEncoder
+
+        if SegmentedFFmpegEncoder is None:
+            pytest.skip("ffmpeg not available")
+
+        with pytest.raises(ValueError, match="total_frames is required"):
+            ChunkedVideoMP4Session(
+                value_range=(-1.0, 1.0),
+                fps=8,
+                use_segmented_encoder=True,
+                segmented_process_count=1,
+            )
+
+    def test_segmented_total_frames_subtracts_skip_frames(self) -> None:
+        """The encoder must be promised the post-skip frame count."""
+        import torch
+
+        from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session, SegmentedFFmpegEncoder
+
+        if SegmentedFFmpegEncoder is None:
+            pytest.skip("ffmpeg not available")
+
+        session = ChunkedVideoMP4Session(
+            value_range=(-1.0, 1.0),
+            fps=8,
+            use_segmented_encoder=True,
+            segmented_process_count=1,
+            transfer_slots=0,
+            total_frames=5,
+            skip_frames=2,
+        )
+        # 5 published frames: 2 dropped as context, 3 encoded.
+        chunk = torch.zeros((1, 3, 5, 16, 24), dtype=torch.float32)
+        session.push(chunk)
+        encoders = session._encoders
+        assert len(encoders) == 1
+        assert isinstance(encoders[0], SegmentedFFmpegEncoder)
+        assert encoders[0]._plan is not None
+        assert encoders[0]._plan.total_frames == 3
+        # frame_counts must work for the segmented encoder too (it feeds the
+        # engine-level frame validation).
+        assert session.frame_counts == [3]
+        session.finish()
+
+    def test_segmented_rejects_total_frames_le_skip_frames(self) -> None:
+        from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session, SegmentedFFmpegEncoder
+
+        if SegmentedFFmpegEncoder is None:
+            pytest.skip("ffmpeg not available")
+
+        with pytest.raises(ValueError, match="must exceed skip_frames"):
+            ChunkedVideoMP4Session(
+                value_range=(-1.0, 1.0),
+                fps=8,
+                use_segmented_encoder=True,
+                segmented_process_count=1,
+                total_frames=2,
+                skip_frames=2,
+            )
 
 
 # ---------------------------------------------------------------------------

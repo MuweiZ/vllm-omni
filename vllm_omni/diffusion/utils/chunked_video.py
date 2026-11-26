@@ -363,7 +363,9 @@ class ChunkedVideoMP4Session:
     ``max_pending_bytes`` bounds their combined uint8 payload size.
     ``use_segmented_encoder`` opts into the experimental SegmentedFFmpegEncoder
     backend that runs ``segmented_process_count`` parallel FFmpeg subprocesses
-    instead of PyAV.
+    instead of PyAV.  That backend requires ``total_frames`` -- the number of
+    frames the producer will push per batch entry, before any ``skip_frames``
+    are dropped -- so segments can be planned up front (RFC 8887 fail-closed).
     """
 
     def __init__(
@@ -382,6 +384,7 @@ class ChunkedVideoMP4Session:
         skip_frames: int = 0,
         use_segmented_encoder: bool = False,
         segmented_process_count: int = 4,
+        total_frames: int | None = None,
     ) -> None:
         if batch_frames <= 0:
             raise ValueError("batch_frames must be positive")
@@ -389,10 +392,24 @@ class ChunkedVideoMP4Session:
             raise ValueError("skip_frames must be non-negative")
         if max_pending_bytes is not None and (type(max_pending_bytes) is not int or max_pending_bytes <= 0):
             raise ValueError("max_pending_bytes must be a positive integer or None")
+        if total_frames is not None and total_frames <= 0:
+            raise ValueError("total_frames must be positive when provided")
         if use_segmented_encoder and SegmentedFFmpegEncoder is None:
             raise RuntimeError(
                 "SegmentedFFmpegEncoder backend not available; ffmpeg must be on PATH to use segmented encoding"
             )
+        if use_segmented_encoder:
+            if total_frames is None:
+                raise ValueError(
+                    "total_frames is required when use_segmented_encoder=True: the segmented "
+                    "backend plans segments up front and rejects unknown frame counts "
+                    "(RFC 8887 fail-closed)"
+                )
+            if total_frames - skip_frames <= 0:
+                raise ValueError(
+                    f"total_frames ({total_frames}) must exceed skip_frames ({skip_frames}) "
+                    "so at least one frame is encoded"
+                )
         self._value_range = value_range
         self._fps = fps
         self._audio_waveforms = audio_waveforms
@@ -406,6 +423,9 @@ class ChunkedVideoMP4Session:
         self._max_pending_bytes = max_pending_bytes
         self._use_segmented_encoder = use_segmented_encoder
         self._segmented_process_count = segmented_process_count
+        # Captured at construction: push() decrements _skip_frames per chunk,
+        # so the post-skip promise cannot be recomputed later.
+        self._segmented_total_frames = None if total_frames is None else total_frames - skip_frames
         self._encoders: list[ChunkedMP4Encoder | SegmentedFFmpegEncoder] = []
         self._output_shape: tuple[int, int, int] | None = None
         self._pending: list[torch.Tensor] = []
@@ -424,7 +444,7 @@ class ChunkedVideoMP4Session:
             return
         waveforms = [self._waveform_for(index, batch_size) for index in range(batch_size)]
         encoder_cls = SegmentedFFmpegEncoder if self._use_segmented_encoder else ChunkedMP4Encoder
-        kwargs_base = dict(
+        kwargs_base: dict[str, Any] = dict(
             width=width,
             height=height,
             fps=self._fps,
@@ -435,11 +455,13 @@ class ChunkedVideoMP4Session:
         try:
             for waveform in waveforms:
                 if encoder_cls is SegmentedFFmpegEncoder:
+                    assert self._segmented_total_frames is not None
                     self._encoders.append(
                         SegmentedFFmpegEncoder(
                             **kwargs_base,
                             audio_waveform=waveform,
                             process_count=self._segmented_process_count,
+                            total_frames=self._segmented_total_frames,
                         )
                     )
                 else:

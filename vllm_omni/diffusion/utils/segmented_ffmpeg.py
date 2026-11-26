@@ -247,22 +247,22 @@ def preflight_check(
     width: int,
     height: int,
     process_count: int,
-    total_frames: int = 0,
+    total_frames: int,
     ffmpeg_path: str | None = None,
 ) -> None:
     """Validate inputs before any GPU work begins. Fails fast on bad params.
 
-    ``total_frames`` defaults to 0 meaning the final frame count is not yet
-    known. In that case we skip the ``process_count <= total_frames`` bound
-    (which only matters when the plan is actually built in :meth:`finish`).
+    ``total_frames`` is the planned output frame count and is required: per
+    RFC 8887, a request whose frame count is unknown fails at preflight
+    instead of silently buffering the whole video in host memory.
     """
     if width <= 0 or height <= 0:
         raise ValueError(f"width and height must be positive, got {width}x{height}")
     if process_count not in (1, 2, 4):
         raise ValueError(f"segmented encoding currently supports 1, 2, or 4 processes, got {process_count}")
-    if total_frames < 0:
-        raise ValueError("total_frames must be non-negative at preflight time")
-    if total_frames > 0 and process_count > total_frames:
+    if total_frames <= 0:
+        raise ValueError("total_frames is required and must be positive at preflight time")
+    if process_count > total_frames:
         raise ValueError(f"process_count ({process_count}) cannot exceed total_frames ({total_frames})")
     # Confirm FFmpeg is reachable early.
     path = ffmpeg_path or _default_ffmpeg_path()
@@ -304,6 +304,7 @@ class _SegmentState:
     stderr_buffer: list[str] = None  # type: ignore[assignment]
     error: BaseException | None = None
     done_event: threading.Event = None  # type: ignore[assignment]
+    start_time: float = 0.0
 
 
 class SegmentedFFmpegEncoder:
@@ -317,11 +318,11 @@ class SegmentedFFmpegEncoder:
     Follows the same ``push()`` / ``finish()`` / ``abort()`` contract as
     :class:`ChunkedMP4Encoder`.
 
-    Pass ``total_frames`` up front to enable streaming mode: the segment plan
-    is built and workers start immediately in ``__init__``, so ``push()``
-    routes frames directly to the correct queue without accumulating the
-    whole video in RAM.  When ``total_frames`` is omitted the encoder falls
-    back to a buffering path that still routes at ``finish()``.
+    ``total_frames`` is required: the segment plan is built and workers
+    start immediately in ``__init__``, so ``push()`` routes frames directly
+    to the correct queue without accumulating the whole video in RAM.
+    Omitting the frame count fails at construction (RFC 8887 fail-closed)
+    instead of falling back to a buffering path.
     """
 
     def __init__(
@@ -348,14 +349,17 @@ class SegmentedFFmpegEncoder:
             raise ValueError(f"segmented encoding only supports 1, 2, or 4 processes, got {process_count}")
         if per_process_threads <= 0:
             raise ValueError("per_process_threads must be positive")
-        if total_frames is not None and total_frames <= 0:
-            raise ValueError("total_frames must be positive when provided")
+        if total_frames is None or total_frames <= 0:
+            raise ValueError(
+                "total_frames is required for segmented encoding (RFC 8887: requests with "
+                f"an unknown frame count fail at preflight instead of buffering); got {total_frames!r}"
+            )
 
         preflight_check(
             width=width,
             height=height,
             process_count=process_count,
-            total_frames=total_frames or 0,
+            total_frames=total_frames,
         )
 
         self.width = int(width)
@@ -375,22 +379,19 @@ class SegmentedFFmpegEncoder:
         self._plan: SegmentPlan | None = None
         self._segments: dict[int, _SegmentState] = {}
         self._segment_threads: dict[int, threading.Thread] = {}
-        self._dispatch_thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
         self._closed = False
         self._aborted = False
         self._failure: BaseException | None = None
 
-        self._pending_frames: list[np.ndarray] = []
         self._total_frames_seen = 0
 
         self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
 
-        # Streaming path (preferred): caller promised a frame count up front,
-        # so we can build the plan and start workers immediately.  push()
-        # then routes directly to per-segment queues without caching.
-        if total_frames is not None:
-            self._build_plan_and_workers(total_frames)
+        # The caller promised a frame count up front, so build the plan and
+        # start workers immediately; push() routes directly to per-segment
+        # queues without caching.
+        self._build_plan_and_workers(total_frames)
 
     # ------------------------------------------------------------------
     # Public API
@@ -402,24 +403,20 @@ class SegmentedFFmpegEncoder:
 
         chunk_frames = int(chunk.shape[0])
 
-        if self._plan is not None:
-            # Streaming path -- verify we won't overrun the promised total.
-            if self._total_frames_seen + chunk_frames > self._plan.total_frames:
-                raise ValueError(
-                    f"push() would exceed total_frames={self._plan.total_frames}: "
-                    f"already sent {self._total_frames_seen}, this chunk adds {chunk_frames}"
-                )
-            # Route directly, keep no frame copies.
-            self._route_chunk_to_segments(chunk)
-            # _route_chunk_to_segments may set _failure on a partial route
-            # (queue timeout, etc.) and return without raising. Re-check so
-            # we do NOT advance the frame count or release the lease for
-            # frames that never entered any queue.
-            self._raise_if_failed()
-        else:
-            # Fallback -- we don't yet know total_frames, so buffer until
-            # finish() builds the plan.
-            self._pending_frames.append(chunk.copy())
+        assert self._plan is not None, "segment plan must be built in __init__"
+        # Verify we won't overrun the promised total.
+        if self._total_frames_seen + chunk_frames > self._plan.total_frames:
+            raise ValueError(
+                f"push() would exceed total_frames={self._plan.total_frames}: "
+                f"already sent {self._total_frames_seen}, this chunk adds {chunk_frames}"
+            )
+        # Route directly, keep no frame copies.
+        self._route_chunk_to_segments(chunk)
+        # _route_chunk_to_segments may set _failure on a partial route
+        # (queue timeout, etc.) and return without raising. Re-check so
+        # we do NOT advance the frame count or release the lease for
+        # frames that never entered any queue.
+        self._raise_if_failed()
 
         self._total_frames_seen += chunk_frames
         if on_consumed is not None:
@@ -431,26 +428,21 @@ class SegmentedFFmpegEncoder:
                 raise RuntimeError("SegmentedFFmpegEncoder is already closed")
             self._closed = True
 
-        if self._plan is not None:
-            # Streaming path -- verify frame count matches, then send EOS.
-            if self._total_frames_seen != self._plan.total_frames:
-                # Frame-count mismatch: abort workers immediately and surface
-                # the original error.  Do NOT try to assemble incomplete
-                # segments or concat/mux -- both would raise misleading errors
-                # that hide this one.  abort() drains queues, injects EOS, and
-                # terminates subprocesses so nothing hangs.
-                count_error = RuntimeError(
-                    f"promised total_frames={self._plan.total_frames} but received {self._total_frames_seen}"
-                )
-                self._failure = count_error
-                self.abort()
-                raise count_error
-            self._send_eos_all()
-        else:
-            # Fallback path -- build the plan and start workers now.
-            if self._total_frames_seen == 0:
-                raise RuntimeError("SegmentedFFmpegEncoder received zero frames")
-            self._build_and_dispatch()
+        assert self._plan is not None, "segment plan must be built in __init__"
+        # Verify frame count matches, then send EOS.
+        if self._total_frames_seen != self._plan.total_frames:
+            # Frame-count mismatch: abort workers immediately and surface
+            # the original error.  Do NOT try to assemble incomplete
+            # segments or concat/mux -- both would raise misleading errors
+            # that hide this one.  abort() drains queues, injects EOS, and
+            # terminates subprocesses so nothing hangs.
+            count_error = RuntimeError(
+                f"promised total_frames={self._plan.total_frames} but received {self._total_frames_seen}"
+            )
+            self._failure = count_error
+            self.abort()
+            raise count_error
+        self._send_eos_all()
 
         self._wait_for_segments()
         result = self._finalize()
@@ -474,9 +466,6 @@ class SegmentedFFmpegEncoder:
                 seg.queue.put_nowait(_SEGMENT_EOS)
             except queue.Full:
                 pass
-
-        if self._dispatch_thread is not None:
-            self._dispatch_thread.join(timeout=5.0)
 
         # Kill subprocesses.
         for seg in self._segments.values():
@@ -503,6 +492,11 @@ class SegmentedFFmpegEncoder:
         self._cleanup_temp()
 
     close = finish
+
+    @property
+    def frame_count(self) -> int:
+        """Frames pushed so far; mirrors ``ChunkedMP4Encoder.frame_count``."""
+        return self._total_frames_seen
 
     # ------------------------------------------------------------------
     # Internal
@@ -558,51 +552,6 @@ class SegmentedFFmpegEncoder:
                 daemon=True,
             )
             self._segment_threads[idx].start()
-
-    def _build_and_dispatch(self) -> None:
-        """Fallback path: build plan from buffered frames and start dispatch."""
-        assert self._plan is None
-        self._build_plan_and_workers(self._total_frames_seen)
-        self._dispatch_buffered_frames()
-
-    def _dispatch_buffered_frames(self) -> None:
-        """Walks buffered frames and routes each to its segment's queue.
-
-        Used only by the fallback path when total_frames was not known up front.
-        """
-        self._dispatch_thread = threading.Thread(target=self._dispatch_worker, name="ffmpeg-dispatch", daemon=True)
-        self._dispatch_thread.start()
-
-    def _dispatch_worker(self) -> None:
-        try:
-            frame_cursor = 0
-            for chunk in self._pending_frames:
-                for local_offset in range(chunk.shape[0]):
-                    if self._aborted or self._failure is not None:
-                        return
-                    seg_idx = self._segment_for_frame(frame_cursor)
-                    if seg_idx is None:
-                        return
-                    frame = chunk[local_offset : local_offset + 1].copy()
-                    try:
-                        self._segments[seg_idx].queue.put(frame, timeout=15.0)
-                    except queue.Full:
-                        if self._failure is None:
-                            self._failure = RuntimeError(f"segment {seg_idx} queue timed out waiting for slot")
-                        return
-                    except Exception:
-                        if self._failure is None:
-                            self._failure = RuntimeError(f"dispatch to segment {seg_idx} failed")
-                        return
-                    frame_cursor += 1
-
-            self._send_eos_all()
-        except BaseException as exc:  # noqa: BLE001
-            if self._failure is None:
-                self._failure = exc
-
-        # Release buffered frame copies so memory can be reclaimed.
-        self._pending_frames.clear()
 
     def _route_chunk_to_segments(self, chunk: np.ndarray) -> None:
         """Stream one chunk's frames directly into per-segment queues.

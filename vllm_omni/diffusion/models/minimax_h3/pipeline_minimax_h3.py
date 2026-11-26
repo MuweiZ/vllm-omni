@@ -2641,6 +2641,8 @@ class MiniMaxH3Pipeline(
                     video_codec_options=video_codec_options,
                     crop=(height, width),
                     skip_frames=0 if trim is None else int(trim["frames"]),
+                    # Pre-skip promise: the session subtracts skip_frames itself.
+                    total_frames=MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(int(video_latent.shape[2])),
                 )
                 start_error: BaseException | None = None
                 if self.video_vae.owns_chunk_output:

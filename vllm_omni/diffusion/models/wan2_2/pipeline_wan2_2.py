@@ -1557,6 +1557,9 @@ class Wan22Pipeline(
                     fps=resolve_wan_output_fps(common),
                     batch_frames=preencode_batch_frames,
                     video_codec_options=resolve_wan_video_codec_options(common),
+                    # Frames the temporal decoder will publish, so a segmented
+                    # encoder can plan segments up front.
+                    total_frames=(latents.shape[2] - 1) * self.vae_scale_factor_temporal + 1,
                 )
             else:
                 decoded = self.vae.decode(latents, return_dict=False)[0]
