@@ -224,14 +224,12 @@ def build_ffmpeg_command(
         str(crf),
         "-threads",
         str(threads),
-        # Constrain output to what the final stream-copy concat accepts later:
-        # constant frame rate, yuv420p, no b-frames for simpler stream copy.
+        # Keep bitrate-affecting options aligned with the default PyAV
+        # production path (crf + yuv420p only): b-frames and GOP stay at
+        # libx264 defaults. B-frames do not break the stream-copy concat:
+        # segments are encoded independently and each starts with an IDR.
         "-pix_fmt",
         "yuv420p",
-        "-bf",
-        "0",
-        "-g",
-        str(max(1, int(fps))),  # keyframe at ~1s cadence
         "-movflags",
         "+faststart",
     ]
